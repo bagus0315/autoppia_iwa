@@ -7,7 +7,7 @@ env:
   tasks_cache_dir: data/cache/tasks
 
 train:
-  policy: MlpPolicy
+  policy: MultiInputPolicy
   learning_rate: 0.0003
   n_steps: 32
   batch_size: 16

@@ -33,6 +33,27 @@ data/cache/**
 # RL checkpoints / traces
 data/rl/**
 
+# Training data files (json, jsonl, txt)
+*.jsonl
+data/**/*.txt
+data/**/*.log
+data/score_model_pipeline/**/*.json
+data/score_model_pipeline/**/*.jsonl
+data/rm/**/*.json
+data/rm/**/*.jsonl
+data/datasets/**/*.json
+data/datasets/**/*.jsonl
+
+# Training logs and artifacts
+runs/
+logs/
+tensorboard_logs/
+*.ckpt
+*.pth
+*.pt.tmp
+training_*.log
+eval_*.log
+
 # Visual inspection outputs
 data/web_verification/screenshots/**
 data/web_verification/visual_inspector/**

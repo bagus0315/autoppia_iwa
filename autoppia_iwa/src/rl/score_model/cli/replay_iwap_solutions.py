@@ -173,12 +173,16 @@ async def replay_for_project(
     skipped = 0
     iterator = tqdm(samples, desc=f"{project.id} replays", unit="task")
     for sample in iterator:
-        # Skip if trace already exists
-        task_trace_dir = instrumentation.output_dir / project.id / sample.task_id
-        if task_trace_dir.exists() and list(task_trace_dir.glob("*.jsonl")):
-            skipped += 1
-            iterator.set_postfix({"skipped": skipped, "completed": total})
-            continue
+        # Check if trace already exists for this task
+        if instrumentation.enabled and instrumentation.output_dir:
+            task_trace_dir = instrumentation.output_dir / project.id / sample.task_id
+            if task_trace_dir.exists():
+                trace_files = list(task_trace_dir.glob("*.jsonl"))
+                if trace_files:
+                    logger.debug("Skipping %s (%s) - trace already exists at %s", sample.task_id, project.id, task_trace_dir)
+                    skipped += 1
+                    continue
+        
         if max_actions is not None and len(sample.actions) > max_actions:
             logger.debug("Skipping %s (%s) due to action limit (%s > %s).", sample.task_id, project.id, len(sample.actions), max_actions)
             continue
@@ -197,7 +201,9 @@ async def replay_for_project(
         total += 1
         if results:
             successes += sum(1 for res in results if getattr(res, "tests_passed", 0))
-        iterator.set_postfix({"skipped": skipped, "completed": total})
+    
+    if skipped > 0:
+        logger.info(f"Skipped {skipped} already-completed tasks for {project.id}")
     return total, successes
 
 
