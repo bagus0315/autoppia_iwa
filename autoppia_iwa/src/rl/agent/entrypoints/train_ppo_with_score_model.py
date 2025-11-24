@@ -199,33 +199,64 @@ def train_ppo(
     # Build environment
     env = build_env(env_cfg)
     
+    # Check if loading from BC checkpoint
+    bc_checkpoint = cfg.get("bc_checkpoint")
+    
     # Initialize PPO model
     logger.info("=" * 60)
     logger.info("INITIALIZING PPO MODEL")
     logger.info("=" * 60)
     
-    policy = train_cfg.get("policy", "MlpPolicy")
-    policy_kwargs = train_cfg.get("policy_kwargs", {})
+    if bc_checkpoint:
+        # Load from BC checkpoint for fine-tuning
+        logger.info(f"Loading BC checkpoint: {bc_checkpoint}")
+        try:
+            model = PPO.load(
+                bc_checkpoint,
+                env=env,
+                tensorboard_log=args.tensorboard_log,
+            )
+            # Update hyperparameters for fine-tuning
+            model.learning_rate = float(train_cfg.get("learning_rate", 1e-4))
+            model.n_steps = int(train_cfg.get("n_steps", 2048))
+            model.batch_size = int(train_cfg.get("batch_size", 64))
+            model.n_epochs = int(train_cfg.get("n_epochs", 10))
+            model.gamma = float(train_cfg.get("gamma", 0.99))
+            model.gae_lambda = float(train_cfg.get("gae_lambda", 0.95))
+            model.clip_range = float(train_cfg.get("clip_range", 0.2))
+            model.ent_coef = float(train_cfg.get("ent_coef", 0.0))
+            model.vf_coef = float(train_cfg.get("vf_coef", 0.5))
+            model.max_grad_norm = float(train_cfg.get("max_grad_norm", 0.5))
+            model.verbose = int(train_cfg.get("verbose", 1))
+            logger.info("BC checkpoint loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load BC checkpoint: {e}")
+            logger.warning("Falling back to creating new model from scratch")
+            bc_checkpoint = None
     
-    model = PPO(
-        policy,
-        env,
-        learning_rate=float(train_cfg.get("learning_rate", 3e-4)),
-        n_steps=int(train_cfg.get("n_steps", 2048)),
-        batch_size=int(train_cfg.get("batch_size", 64)),
-        n_epochs=int(train_cfg.get("n_epochs", 10)),
-        gamma=float(train_cfg.get("gamma", 0.99)),
-        gae_lambda=float(train_cfg.get("gae_lambda", 0.95)),
-        clip_range=float(train_cfg.get("clip_range", 0.2)),
-        ent_coef=float(train_cfg.get("ent_coef", 0.0)),
-        vf_coef=float(train_cfg.get("vf_coef", 0.5)),
-        max_grad_norm=float(train_cfg.get("max_grad_norm", 0.5)),
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=args.tensorboard_log,
-        verbose=int(train_cfg.get("verbose", 1)),
-    )
+    if not bc_checkpoint:
+        # Create new model from scratch
+        policy = train_cfg.get("policy", "MultiInputPolicy")
+        policy_kwargs = train_cfg.get("policy_kwargs", {})
+        
+        model = PPO(
+            policy,
+            env,
+            learning_rate=float(train_cfg.get("learning_rate", 3e-4)),
+            n_steps=int(train_cfg.get("n_steps", 2048)),
+            batch_size=int(train_cfg.get("batch_size", 64)),
+            n_epochs=int(train_cfg.get("n_epochs", 10)),
+            gamma=float(train_cfg.get("gamma", 0.99)),
+            gae_lambda=float(train_cfg.get("gae_lambda", 0.95)),
+            clip_range=float(train_cfg.get("clip_range", 0.2)),
+            ent_coef=float(train_cfg.get("ent_coef", 0.0)),
+            vf_coef=float(train_cfg.get("vf_coef", 0.5)),
+            max_grad_norm=float(train_cfg.get("max_grad_norm", 0.5)),
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=args.tensorboard_log,
+            verbose=int(train_cfg.get("verbose", 1)),
+        )
     
-    logger.info(f"Policy: {policy}")
     logger.info(f"Learning rate: {model.learning_rate}")
     logger.info(f"Batch size: {model.batch_size}")
     logger.info(f"Gamma: {model.gamma}")

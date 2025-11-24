@@ -64,32 +64,27 @@ class RLModelAgent(IWebAgent):
         }
         env = IWAWebEnv(cfg)
 
-        # Try to import sb3-contrib and load the trained model
+        # Try to load the trained PPO model
         model = None
-        env_wrapped = env
         try:
-            from sb3_contrib import MaskablePPO  # type: ignore
-            from sb3_contrib.common.wrappers import ActionMasker  # type: ignore
-
-            def mask_fn(e):
-                return e.get_action_mask()
-
-            env_wrapped = ActionMasker(env, mask_fn)
+            from stable_baselines3 import PPO  # type: ignore
+            
             model_path = Path(self.config.model_path)
             if model_path.exists():
-                model = MaskablePPO.load(str(model_path), env=env_wrapped, print_system_info=False)
-                logger.info(f"[{self.name}] Loaded RL model from {model_path}")
+                # Load the PPO model (trained with standard SB3 PPO, not MaskablePPO)
+                model = PPO.load(str(model_path), env=env, print_system_info=False)
+                logger.info(f"[{self.name}] ✅ Loaded trained PPO model from {model_path}")
             else:
                 logger.warning(f"[{self.name}] Model path not found: {model_path}. Using fallback policy.")
         except Exception as e:
-            logger.warning(f"[{self.name}] SB3 not available or failed to load model: {e}. Using fallback policy.")
+            logger.warning(f"[{self.name}] Failed to load PPO model: {e}. Using fallback policy.")
             model = None
 
         # Rollout
         import numpy as _np
 
         try:
-            obs, _ = env_wrapped.reset(options={"task": task})  # type: ignore[arg-type]
+            obs, _ = env.reset(options={"task": task})  # type: ignore[arg-type]
             done = False
             trunc = False
             rng = _np.random.default_rng(0)
@@ -103,7 +98,7 @@ class RLModelAgent(IWebAgent):
                     valid = _np.where(mask)[0]
                     action = int(rng.choice(valid)) if valid.size else 0
 
-                obs, _rew, done, trunc, _info = env_wrapped.step(int(action))
+                obs, _rew, done, trunc, _info = env.step(int(action))
 
             history = env.get_execution_history()
             solution = history_to_task_solution(task, history, web_agent_id=self.id)

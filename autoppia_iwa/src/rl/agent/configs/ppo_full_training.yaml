@@ -1,0 +1,19 @@
+env:
+  reward_model_path: data/rm/ckpts/reward_model.pt
+  max_steps: 20
+  project_start_index: 0
+  topk: 8
+  use_cached_tasks: true
+  tasks_cache_dir: data/cache/tasks
+
+train:
+  policy: MultiInputPolicy
+  learning_rate: 0.0003
+  n_steps: 128        # Increased for better gradient estimates
+  batch_size: 64      # Increased for more stable updates
+  gamma: 0.99
+  total_timesteps: 5000  # ~40 episodes, enough for initial learning
+  verbose: 1
+  checkpoint_path: data/rl/checkpoints/ppo_full_training
+  checkpoint_freq: 1000  # Save every 1000 steps
+

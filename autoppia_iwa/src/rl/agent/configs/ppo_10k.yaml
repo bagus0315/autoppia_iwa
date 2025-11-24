@@ -1,0 +1,16 @@
+env:
+  max_steps: 10
+  project_start_index: 0
+  reward_model_path: data/rm/ckpts/reward_model.pt
+  tasks_cache_dir: data/cache/tasks
+  topk: 8
+  use_cached_tasks: true
+train:
+  batch_size: 64
+  checkpoint_path: data/rl/checkpoints/ppo_10k
+  gamma: 0.99
+  learning_rate: 0.0003
+  n_steps: 512
+  policy: MultiInputPolicy
+  total_timesteps: 10000
+  verbose: 1

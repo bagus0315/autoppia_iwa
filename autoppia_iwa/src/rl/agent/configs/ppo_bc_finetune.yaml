@@ -1,0 +1,50 @@
+##
+## PPO Fine-tuning Configuration - BC+PPO
+##
+## This configuration fine-tunes a BC-pretrained policy with PPO
+## using the improved reward model (86.2% accuracy).
+##
+## Expected performance: 55-75% success rate
+##
+
+# BC Checkpoint (warm start)
+bc_checkpoint: data/rl/checkpoints/bc_full_8k/bc_policy_full_8k.zip
+
+# Training Configuration
+train:
+  total_timesteps: 50000  # 50K steps for fine-tuning (less than pure PPO since BC warm-start)
+  policy: MultiInputPolicy
+  learning_rate: 0.0001  # Lower LR for fine-tuning (vs 0.0003 for pure PPO)
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  checkpoint_path: data/rl/checkpoints/bc_ppo_finetune
+  verbose: 1
+
+# Environment
+env:
+  topk: 50  # Must match BC checkpoint training config
+  max_steps: 50
+  goal_vocab_size: 4096
+  dom_vocab_size: 8192
+  url_vocab_size: 1024
+  max_goal_tokens: 48
+  max_dom_tokens: 200
+  max_element_tokens: 12
+  action_history: 10
+  # project_name: null  # Train on ALL websites (multi-domain agent)
+  reward_model_path: data/rm/ckpts/reward_model_10k_improved.pkl  # 86.2% accuracy
+  dataset_path: data/score_model_pipeline/datasets/leaderboard_31k_flattened.jsonl  # 31,477 tasks across 13 websites
+
+# Notes:
+# - BC provides strong initialization (55-65% success)
+# - PPO fine-tuning adds additional 5-10% improvement
+# - Improved RM (86.2% acc) guides exploration
+# - Lower LR prevents catastrophic forgetting of BC
+# - Fewer timesteps needed due to BC warm-start

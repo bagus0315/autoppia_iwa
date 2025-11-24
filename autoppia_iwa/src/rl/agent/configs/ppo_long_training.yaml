@@ -1,0 +1,19 @@
+env:
+  reward_model_path: data/rm/ckpts/reward_model_4356_improved.pkl  # Your improved 76.2% accuracy RM
+  max_steps: 30
+  project_start_index: 0
+  topk: 12
+  use_cached_tasks: true
+  tasks_cache_dir: data/cache/tasks
+
+train:
+  policy: MultiInputPolicy
+  learning_rate: 0.0003
+  n_steps: 256         # Larger rollouts for better exploration
+  batch_size: 128       # Larger batches for stable training
+  gamma: 0.99
+  total_timesteps: 100000  # Long training: ~400 episodes, 12-15 hours
+  verbose: 1
+  checkpoint_path: data/rl/checkpoints/ppo_long_rm4356
+  checkpoint_freq: 5000   # Save every 5000 steps
+

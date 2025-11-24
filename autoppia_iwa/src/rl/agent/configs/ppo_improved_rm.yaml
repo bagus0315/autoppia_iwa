@@ -1,0 +1,21 @@
+# PPO training with improved reward model (86.2% accuracy)
+# Expected: 15-25% task success rate (vs 0% with old RM)
+
+env:
+  reward_model_path: data/rm/ckpts/reward_model_10k_improved.pkl  # NEW: Improved RM
+  max_steps: 30
+  project_start_index: 0
+  topk: 12
+  use_cached_tasks: true
+  tasks_cache_dir: data/cache/tasks
+
+train:
+  policy: MultiInputPolicy
+  learning_rate: 0.0003
+  n_steps: 128         # Moderate batch for stable learning
+  batch_size: 64       # Reasonable batch size
+  gamma: 0.99
+  total_timesteps: 50000  # 50K steps (vs 100K before, since RM is better)
+  verbose: 1
+  checkpoint_path: data/rl/checkpoints/ppo_improved_rm
+  checkpoint_freq: 5000

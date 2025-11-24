@@ -15,6 +15,7 @@ from ..runtime.browser_manager import BrowserManager
 from ..runtime.stateful_evaluator import PartialScore, StatefulEvaluator
 from autoppia_iwa.src.demo_webs.config import demo_web_projects
 from autoppia_iwa.src.data_generation.tasks.classes import Task
+from .dataset_task_loader import DatasetTaskLoader
 
 
 class MacroAction(enum.IntEnum):
@@ -99,6 +100,18 @@ class IWAWebEnv(gym.Env):
             except Exception as e:
                 logger.warning(f"Failed to initialize RewardBlender ({e}). Continuing without shaped reward.")
                 self._reward_blender = None
+        
+        # Dataset task loader for diverse PPO training
+        self._dataset_loader = None
+        dataset_path = self.cfg.get("dataset_path")
+        if dataset_path:
+            try:
+                project_filter = self.cfg.get("project_name")  # e.g., "autoppia_cinema"
+                self._dataset_loader = DatasetTaskLoader(dataset_path, project_filter=project_filter)
+                logger.info(f"Loaded {self._dataset_loader.get_task_count()} tasks from {dataset_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load dataset tasks ({e}). Will use cached tasks.")
+                self._dataset_loader = None
 
     # -------------------------
     # Helpers
@@ -185,14 +198,23 @@ class IWAWebEnv(gym.Env):
         # Obtener task real: se puede pasar via options['task'] o generarla
         task: Optional[Task] = options.get("task") if isinstance(options.get("task"), Task) else None
         if not task:
-            # Select project honoring project_start_index and repository bounds
-            try:
-                idx = max(0, min(len(demo_web_projects) - 1, int(self.project_start_index)))
-            except Exception:
-                idx = 0
-            project = demo_web_projects[idx]
-            tasks = self._generate_tasks_sync(project)
-            task = tasks[0] if tasks else None
+            # Try to sample from dataset loader first (for diverse PPO training)
+            if self._dataset_loader:
+                task = self._dataset_loader.sample_task()
+            else:
+                # Fallback to cached tasks
+                # Select project honoring project_start_index and repository bounds
+                try:
+                    idx = max(0, min(len(demo_web_projects) - 1, int(self.project_start_index)))
+                except Exception:
+                    idx = 0
+                project = demo_web_projects[idx]
+                tasks = self._generate_tasks_sync(project)
+                # Randomly sample a task for RL exploration (instead of always tasks[0])
+                if tasks:
+                    task = self.np_random.choice(tasks) if len(tasks) > 1 else tasks[0]
+                else:
+                    task = None
         if not task:
             raise RuntimeError("No se pudo obtener una Task real. Pase options={'task': Task} o revise pipeline.")
         self._task = task

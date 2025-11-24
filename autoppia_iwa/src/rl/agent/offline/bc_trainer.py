@@ -153,7 +153,26 @@ class BehaviorCloningTrainer:
         obs = {key: tensor.to(self.device) for key, tensor in batch["obs"].items()}
         mask = batch["action_mask"].to(self.device)
         actions = batch["action"].to(self.device)
-        distribution = self.policy.get_distribution(obs, action_masks=mask)
+        
+        # Try to use action masks if supported (MaskablePPO), otherwise use standard policy
+        try:
+            distribution = self.policy.get_distribution(obs, action_masks=mask)
+        except TypeError:
+            # Standard PPO doesn't support action_masks, get distribution without it
+            distribution = self.policy.get_distribution(obs)
+            
+            # Apply mask manually to logits
+            if hasattr(distribution.distribution, "logits"):
+                logits = distribution.distribution.logits
+                # Set invalid actions to very negative value
+                masked_logits = torch.where(
+                    mask,
+                    logits,
+                    torch.tensor(float('-inf'), device=logits.device)
+                )
+                # Update the distribution with masked logits
+                distribution.distribution.logits = masked_logits
+        
         log_prob = distribution.log_prob(actions)
         if hasattr(distribution.distribution, "probs"):
             probs = distribution.distribution.probs
