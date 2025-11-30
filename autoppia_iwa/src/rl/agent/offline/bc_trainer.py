@@ -86,6 +86,15 @@ class BehaviorCloningConfig:
     num_workers: int = 0
     log_interval: int = 20
     device: Optional[str] = None
+    # Anti-NOOP features
+    noop_weight: float = 0.1  # Weight for NOOP action (action_index=0), lower = penalize more
+    filter_noop_trajectories: bool = True  # Filter trajectories with >30% NOOP
+    monitor_action_dist: bool = True  # Track predicted action distribution
+    # Anti-loop features
+    filter_repetitive_trajectories: bool = True  # Filter trajectories with repetitive actions
+    max_consecutive_repeats: int = 3  # Max consecutive identical actions allowed
+    temporal_penalty: float = 0.5  # Penalty weight for repeating recent actions
+    min_action_diversity: float = 0.3  # Minimum unique actions ratio in trajectory
 
 
 class BehaviorCloningTrainer:
@@ -110,13 +119,81 @@ class BehaviorCloningTrainer:
         trajectories = list(provider.fetch(self.cfg.max_trajectories))
         if not trajectories:
             raise RuntimeError("Behavior cloning provider returned no trajectories.")
+        
+        # Filter NOOP-heavy trajectories if enabled
+        if self.cfg.filter_noop_trajectories:
+            filtered_trajs = []
+            for traj in trajectories:
+                noop_count = sum(1 for step in traj.steps if step.action_index == 0)
+                noop_ratio = noop_count / len(traj.steps) if traj.steps else 0
+                if noop_ratio <= 0.3:  # Keep only trajectories with <=30% NOOP
+                    filtered_trajs.append(traj)
+            logger.info(
+                "Filtered %d/%d trajectories (kept only <=30%% NOOP)",
+                len(trajectories) - len(filtered_trajs),
+                len(trajectories),
+            )
+            trajectories = filtered_trajs
+        
+        # Filter repetitive action trajectories if enabled
+        if self.cfg.filter_repetitive_trajectories:
+            filtered_trajs = []
+            for traj in trajectories:
+                # Check for consecutive repeats
+                has_long_repeat = False
+                if len(traj.steps) > self.cfg.max_consecutive_repeats:
+                    consecutive_count = 1
+                    last_action = traj.steps[0].action_index
+                    for step in traj.steps[1:]:
+                        if step.action_index == last_action:
+                            consecutive_count += 1
+                            if consecutive_count > self.cfg.max_consecutive_repeats:
+                                has_long_repeat = True
+                                break
+                        else:
+                            consecutive_count = 1
+                            last_action = step.action_index
+                
+                # Check action diversity
+                unique_actions = len(set(step.action_index for step in traj.steps))
+                diversity_ratio = unique_actions / len(traj.steps) if traj.steps else 0
+                
+                # Keep trajectory if no long repeats and good diversity
+                if not has_long_repeat and diversity_ratio >= self.cfg.min_action_diversity:
+                    filtered_trajs.append(traj)
+            
+            logger.info(
+                "Filtered %d/%d trajectories (removed repetitive/undiverse)",
+                len(trajectories) - len(filtered_trajs),
+                len(trajectories),
+            )
+            trajectories = filtered_trajs
+            
+        if not trajectories:
+            raise RuntimeError("No trajectories left after NOOP filtering!")
+            
         dataset = TrajectoryDataset(trajectories, max_steps=self.cfg.max_steps)
         self.spec = dataset.spec
+        
+        # Log action distribution in dataset
+        action_counts = {}
+        for step in dataset._steps:
+            action_counts[step.action_index] = action_counts.get(step.action_index, 0) + 1
+        noop_count = action_counts.get(0, 0)
+        noop_pct = (noop_count / len(dataset)) * 100 if len(dataset) > 0 else 0
+        
         logger.info(
             "Loaded %d trajectories (%d steps) for BC training (action_dim=%d).",
             len(trajectories),
             len(dataset),
             dataset.spec.action_dim,
+        )
+        logger.info(
+            "Action distribution: NOOP=%d (%.1f%%), Non-NOOP=%d (%.1f%%)",
+            noop_count,
+            noop_pct,
+            len(dataset) - noop_count,
+            100 - noop_pct,
         )
         return dataset
 
@@ -197,15 +274,50 @@ class BehaviorCloningTrainer:
             "epochs": float(self.cfg.epochs),
         }
 
+        # Initialize action distribution monitor if enabled
+        action_dist_monitor = None
+        if self.cfg.monitor_action_dist:
+            action_dim = self.spec.action_dim if self.spec else 56
+            action_dist_monitor = torch.zeros(action_dim, device=self.device)
+
         for epoch in range(1, self.cfg.epochs + 1):
             self.policy.train()
             total_loss = 0.0
             total_correct = 0
             total_samples = 0
-
+            
+            # Reset monitor each epoch
+            if action_dist_monitor is not None:
+                action_dist_monitor.zero_()
+            
             for step_idx, batch in enumerate(train_loader, start=1):
                 log_prob, preds, actions = self._forward(batch)
-                loss = -log_prob.mean()
+                
+                # Apply class weighting: lower weight for NOOP (action=0)
+                weights = torch.where(
+                    actions == 0,
+                    torch.tensor(self.cfg.noop_weight, device=actions.device),
+                    torch.tensor(1.0, device=actions.device)
+                )
+                
+                # Add temporal penalty for repeating recent actions
+                temporal_penalty_term = torch.tensor(0.0, device=self.device)
+                if self.cfg.temporal_penalty > 0:
+                    # Get previous actions from observation
+                    prev_actions = batch["obs"]["prev_actions"].to(self.device)  # Shape: [batch_size, action_history]
+                    
+                    # For each sample, check if predicted action is in recent history
+                    for i in range(preds.size(0)):
+                        pred_action = preds[i].item()
+                        recent_actions = prev_actions[i].cpu().numpy()
+                        # Check if predicted action appears in recent history (last few steps)
+                        if len(recent_actions) > 0 and pred_action in recent_actions[-3:]:
+                            # Add penalty if action repeats recent history
+                            temporal_penalty_term += self.cfg.temporal_penalty
+                    
+                    temporal_penalty_term = temporal_penalty_term / preds.size(0)
+                
+                loss = -(log_prob * weights).mean() + temporal_penalty_term
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -216,6 +328,12 @@ class BehaviorCloningTrainer:
                 total_loss += loss.item() * actions.size(0)
                 total_correct += (preds == actions).sum().item()
                 total_samples += actions.size(0)
+                
+                # Monitor predicted action distribution
+                if self.cfg.monitor_action_dist:
+                    for pred in preds:
+                        if pred < action_dist_monitor.size(0):
+                            action_dist_monitor[pred] += 1
 
                 if self.cfg.log_interval and step_idx % self.cfg.log_interval == 0:
                     avg_loss = total_loss / max(1, total_samples)
@@ -233,6 +351,22 @@ class BehaviorCloningTrainer:
             history["train_loss"] = train_loss
             history["train_acc"] = train_acc
             logger.info("BC epoch %d summary: loss=%.4f acc=%.4f", epoch, train_loss, train_acc)
+            
+            # Log predicted action distribution
+            if self.cfg.monitor_action_dist:
+                total_preds = action_dist_monitor.sum().item()
+                if total_preds > 0:
+                    noop_preds = action_dist_monitor[0].item()
+                    noop_pred_pct = (noop_preds / total_preds) * 100
+                    logger.info(
+                        "  Predicted actions: NOOP=%d (%.1f%%), Non-NOOP=%d (%.1f%%)",
+                        int(noop_preds),
+                        noop_pred_pct,
+                        int(total_preds - noop_preds),
+                        100 - noop_pred_pct,
+                    )
+                    if noop_pred_pct > 80:
+                        logger.warning("⚠️  Model is collapsing to NOOP! >80%% predictions are NOOP")
 
             if val_loader is not None:
                 self.policy.eval()

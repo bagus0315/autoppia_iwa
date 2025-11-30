@@ -10,8 +10,7 @@ import argparse
 from pathlib import Path
 
 from loguru import logger
-from sb3_contrib import MaskablePPO
-from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3 import PPO
 
 from autoppia_iwa.src.rl.agent.envs.iwa_env import IWAWebEnv
 from autoppia_iwa.src.rl.agent.offline.bc_trainer import (
@@ -175,16 +174,10 @@ def main():
     logger.info("🏗️  Initializing policy...")
     dummy_env = IWAWebEnv(env_config)
     
-    # Wrap environment with ActionMasker for MaskablePPO
-    def mask_fn(env):
-        return env.get_action_mask()
-    
-    wrapped_env = ActionMasker(dummy_env, mask_fn)
-    
-    # Create MaskablePPO model (we'll use its policy for BC training)
-    model = MaskablePPO(
+    # Create PPO model (we'll use its policy for BC training)
+    model = PPO(
         policy="MultiInputPolicy",
-        env=wrapped_env,
+        env=dummy_env,
         learning_rate=args.learning_rate,
         verbose=0,
     )

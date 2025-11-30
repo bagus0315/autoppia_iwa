@@ -13,6 +13,8 @@ from loguru import logger
 from ..runtime.action_adapter import ActionAdapter, ActionLayout
 from ..runtime.browser_manager import BrowserManager
 from ..runtime.stateful_evaluator import PartialScore, StatefulEvaluator
+from ..utils.tokenizer import get_goal_tokenizer, get_dom_tokenizer, get_url_tokenizer
+from ..utils.dom_cleaner import get_dom_cleaner
 from autoppia_iwa.src.demo_webs.config import demo_web_projects
 from autoppia_iwa.src.data_generation.tasks.classes import Task
 from .dataset_task_loader import DatasetTaskLoader
@@ -26,6 +28,7 @@ class MacroAction(enum.IntEnum):
     BACK = 4
 
 
+# Legacy hash-based tokenization (kept for backward compatibility)
 def _hash_token(token: str, vocab: int) -> int:
     digest = hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest()
     return int.from_bytes(digest, "little") % vocab
@@ -60,10 +63,21 @@ class IWAWebEnv(gym.Env):
         # Whether to use cached tasks or force regeneration
         self.use_cached_tasks = bool(self.cfg.get("use_cached_tasks", False))
 
+        # Support variable K (don't always use same K)
+        self.use_variable_k = bool(self.cfg.get("use_variable_k", False))
+        self.k_min = int(self.cfg.get("k_min", self.K))
+        self.k_max = int(self.cfg.get("k_max", self.K))
+        
         self.layout = ActionLayout(topk=self.K)
         self.action_adapter = ActionAdapter(self.layout)
 
         self.action_space = spaces.Discrete(1 + self.K + len(self.layout.macros))
+        
+        # Initialize tokenizers
+        self.goal_tokenizer = get_goal_tokenizer(vocab_size=self.goal_vocab)
+        self.dom_tokenizer = get_dom_tokenizer(vocab_size=self.dom_vocab)
+        self.url_tokenizer = get_url_tokenizer(vocab_size=self.url_vocab)
+        self.dom_cleaner = get_dom_cleaner()
         self.observation_space = spaces.Dict(
             {
                 "goal_ids": spaces.Box(low=0, high=self.goal_vocab, shape=(self.max_goal_tokens,), dtype=np.int32),
@@ -117,21 +131,41 @@ class IWAWebEnv(gym.Env):
     # Helpers
     # -------------------------
     def _encode_tokens(self, tokens: list[str], limit: int, vocab: int) -> np.ndarray:
+        """Legacy hash-based encoding (kept for backward compatibility)."""
         arr = np.zeros((limit,), dtype=np.int32)
         for i, t in enumerate(tokens[:limit]):
             arr[i] = _hash_token(t, vocab)
         return arr
 
-    def _encode_text(self, text: str, limit: int, vocab: int) -> np.ndarray:
-        return self._encode_tokens(_tokenize(text), limit, vocab)
+    def _encode_text(self, text: str, limit: int, vocab: int, use_tokenizer: bool = True) -> np.ndarray:
+        """Encode text using tokenizer (preferred) or hash fallback."""
+        if use_tokenizer:
+            # Use proper tokenizer
+            if vocab == self.goal_vocab:
+                token_ids = self.goal_tokenizer.encode(text, max_length=limit)
+            elif vocab == self.dom_vocab:
+                token_ids = self.dom_tokenizer.encode(text, max_length=limit)
+            elif vocab == self.url_vocab:
+                token_ids = self.url_tokenizer.encode(text, max_length=limit)
+            else:
+                # Fallback to hash
+                token_ids = self._encode_tokens(_tokenize(text), limit, vocab)
+            
+            arr = np.zeros((limit,), dtype=np.int32)
+            arr[:len(token_ids)] = token_ids[:limit]
+            return arr
+        else:
+            # Legacy hash-based encoding
+            return self._encode_tokens(_tokenize(text), limit, vocab)
 
     def _obs(self, html: str, url: str, score: float) -> dict:
         goal = self._task.prompt if self._task else ""
         # topk text and meta
+        use_tokenizer = bool(self.cfg.get("use_tokenizer", True))
         topk_text_ids = np.zeros((self.K, self.max_element_tokens), dtype=np.int32)
         topk_meta = np.zeros((self.K, 8), dtype=np.float32)
         for i, c in enumerate(self._cands[: self.K]):
-            topk_text_ids[i] = self._encode_text(c.text, self.max_element_tokens, self.dom_vocab)
+            topk_text_ids[i] = self._encode_text(c.text, self.max_element_tokens, self.dom_vocab, use_tokenizer=use_tokenizer)
             cx, cy = c.center()
             cxn = min(1.0, max(0.0, (cx or 0.0) / 1920.0))
             cyn = min(1.0, max(0.0, (cy or 0.0) / 1080.0))
@@ -155,10 +189,20 @@ class IWAWebEnv(gym.Env):
                 dtype=np.float32,
             )
 
+        # Use tokenizer for encoding (preferred over hash)
+        use_tokenizer = bool(self.cfg.get("use_tokenizer", True))
+        
+        # Encode URL using tokenizer
+        if use_tokenizer:
+            url_token_ids = self.url_tokenizer.encode(url or "", max_length=1)
+            url_id = np.array([url_token_ids[0] if url_token_ids else 0], dtype=np.int32)
+        else:
+            url_id = np.array([_hash_token(url or "", self.url_vocab)], dtype=np.int32)
+        
         return {
-            "goal_ids": self._encode_text(goal, self.max_goal_tokens, self.goal_vocab),
-            "dom_ids": self._encode_text(html, self.max_dom_tokens, self.dom_vocab),
-            "url_id": np.array([_hash_token(url or "", self.url_vocab)], dtype=np.int32),
+            "goal_ids": self._encode_text(goal, self.max_goal_tokens, self.goal_vocab, use_tokenizer=use_tokenizer),
+            "dom_ids": self._encode_text(html, self.max_dom_tokens, self.dom_vocab, use_tokenizer=use_tokenizer),
+            "url_id": url_id,
             "prev_actions": np.array(list(self._history) + [0] * (self.history_len - len(self._history)), dtype=np.int32),
             "topk_text_ids": topk_text_ids,
             "topk_meta": topk_meta,
@@ -185,6 +229,8 @@ class IWAWebEnv(gym.Env):
     # Gym API
     # -------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[Mapping[str, object]] = None):
+        # Be careful with seed - ensure proper seeding for diverse exploration
+        # If seed is None, gymnasium will use a random seed automatically
         super().reset(seed=seed)
         options = dict(options or {})
 
@@ -224,7 +270,14 @@ class IWAWebEnv(gym.Env):
         logger.info("ENV.reset: start")
         self._evaluator.reset()
         logger.info("ENV.reset: evaluator.reset done")
-        self._browser = BrowserManager(self._evaluator.page)
+        # Initialize browser manager with reranker support
+        use_reranker = bool(self.cfg.get("use_reranker", True))
+        reranker_model_path = self.cfg.get("reranker_model_path")
+        self._browser = BrowserManager(
+            self._evaluator.page,
+            use_reranker=use_reranker,
+            reranker_model_path=reranker_model_path,
+        )
         self._history.clear()
         self._step = 0
         self._last_partial = self._evaluator.get_partial_score()
@@ -237,7 +290,8 @@ class IWAWebEnv(gym.Env):
         # Estado inicial de DOM y Top‑K
         logger.info("ENV.reset: snapshot start")
         try:
-            html, url = self._evaluator.run_with_timeout(self._browser.snapshot_text(), 3.0)
+            # Use DOM cleaner
+            html, url = self._evaluator.run_with_timeout(self._browser.snapshot_text(clean_dom=True), 3.0)
         except Exception as e:
             logger.warning(f"ENV.reset: snapshot failed: {e}")
             html, url = "", ""
@@ -245,9 +299,36 @@ class IWAWebEnv(gym.Env):
 
         logger.info("ENV.reset: topk start")
         try:
+            # Support variable K (be careful not to always use same K)
+            current_k = self.K
+            if self.use_variable_k and self.k_min != self.k_max:
+                current_k = int(self.np_random.integers(self.k_min, self.k_max + 1))
+                logger.debug(f"Using variable K={current_k} (range: {self.k_min}-{self.k_max})")
+            
+            use_llm_rerank = bool(self.cfg.get("use_llm_rerank", False))
             self._cands, self._click_mask, self._macros = self._evaluator.run_with_timeout(
-                self._browser.topk(self._task.prompt, self.K), 5.0
+                self._browser.topk(self._task.prompt, current_k, use_llm=use_llm_rerank), 5.0
             )
+            # Ensure we have exactly self.K candidates (pad if needed)
+            while len(self._cands) < self.K:
+                from ..runtime.browser_manager import Candidate
+                self._cands.append(Candidate(
+                    idx=len(self._cands),
+                    tag="",
+                    role=None,
+                    text="",
+                    clickable=False,
+                    focusable=False,
+                    editable=False,
+                    visible=False,
+                    enabled=False,
+                    bbox=None,
+                ))
+            self._cands = self._cands[:self.K]
+            # Update click mask to match self.K
+            if len(self._click_mask) < self.K:
+                self._click_mask = np.pad(self._click_mask, (0, self.K - len(self._click_mask)), constant_values=False)
+            self._click_mask = self._click_mask[:self.K]
         except Exception as e:
             logger.warning(f"ENV.reset: topk failed: {e}")
             self._cands, self._click_mask, self._macros = [], np.zeros((self.K,), dtype=np.bool_), {k: False for k in ("type_confirm", "submit", "scroll_down", "scroll_up", "back")}
@@ -319,7 +400,8 @@ class IWAWebEnv(gym.Env):
         # Recalcular estado y score parcial
         logger.info("ENV.step: snapshot start")
         try:
-            html, url = self._evaluator.run_with_timeout(self._browser.snapshot_text(), 3.0)
+            # Use DOM cleaner
+            html, url = self._evaluator.run_with_timeout(self._browser.snapshot_text(clean_dom=True), 3.0)
         except Exception as e:
             logger.warning(f"ENV.step: snapshot failed: {e}")
             html, url = "", ""
@@ -327,9 +409,35 @@ class IWAWebEnv(gym.Env):
 
         logger.info("ENV.step: topk start")
         try:
+            # Support variable K
+            current_k = self.K
+            if self.use_variable_k and self.k_min != self.k_max:
+                current_k = int(self.np_random.integers(self.k_min, self.k_max + 1))
+            
+            use_llm_rerank = bool(self.cfg.get("use_llm_rerank", False))
             self._cands, self._click_mask, self._macros = self._evaluator.run_with_timeout(
-                self._browser.topk(self._task.prompt, self.K), 5.0
+                self._browser.topk(self._task.prompt, current_k, use_llm=use_llm_rerank), 5.0
             )
+            # Ensure we have exactly self.K candidates
+            while len(self._cands) < self.K:
+                from ..runtime.browser_manager import Candidate
+                self._cands.append(Candidate(
+                    idx=len(self._cands),
+                    tag="",
+                    role=None,
+                    text="",
+                    clickable=False,
+                    focusable=False,
+                    editable=False,
+                    visible=False,
+                    enabled=False,
+                    bbox=None,
+                ))
+            self._cands = self._cands[:self.K]
+            # Update click mask
+            if len(self._click_mask) < self.K:
+                self._click_mask = np.pad(self._click_mask, (0, self.K - len(self._click_mask)), constant_values=False)
+            self._click_mask = self._click_mask[:self.K]
         except Exception as e:
             logger.warning(f"ENV.step: topk failed: {e}")
             self._cands, self._click_mask, self._macros = [], np.zeros((self.K,), dtype=np.bool_), {k: False for k in ("type_confirm", "submit", "scroll_down", "scroll_up", "back")}

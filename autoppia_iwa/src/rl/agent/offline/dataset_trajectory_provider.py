@@ -210,6 +210,12 @@ class DatasetTrajectoryProvider(TrajectoryProvider):
             
             # Replay each action
             for action_idx, action in enumerate(actions):
+                # Skip NavigateAction and WaitAction (not learnable actions)
+                action_type = action.__class__.__name__
+                if action_type in ("NavigateAction", "WaitAction"):
+                    logger.debug(f"Skipping {action_type} (not learnable)")
+                    continue
+                
                 # Get action mask before step
                 action_mask = env.get_action_mask()
                 
@@ -295,12 +301,21 @@ class DatasetTrajectoryProvider(TrajectoryProvider):
                     logger.debug(f"Error computing similarity for candidate {idx}: {e}")
                     continue
             
-            # Similarity threshold: accept if ≥60% match
-            SIMILARITY_THRESHOLD = 0.6
+            # Primary threshold: accept if ≥50% match
+            PRIMARY_THRESHOLD = 0.5
+            # Fallback threshold: accept best candidate if ≥30% match
+            FALLBACK_THRESHOLD = 0.3
             
-            if best_similarity >= SIMILARITY_THRESHOLD:
+            if best_similarity >= PRIMARY_THRESHOLD:
                 logger.debug(
                     f"Matched {expert_action.__class__.__name__} with "
+                    f"similarity {best_similarity:.2f} (idx={best_idx})"
+                )
+                return best_idx
+            elif best_similarity >= FALLBACK_THRESHOLD:
+                # Accept as fallback match
+                logger.debug(
+                    f"Fallback match {expert_action.__class__.__name__} with "
                     f"similarity {best_similarity:.2f} (idx={best_idx})"
                 )
                 return best_idx
@@ -349,10 +364,16 @@ class DatasetTrajectoryProvider(TrajectoryProvider):
             
             # CLICK ACTIONS: Match clickable elements by position
             if action_type == "ClickAction":
-                if is_clickable and is_visible:
-                    similarity += 0.4  # Base score for clickable + visible
+                if is_visible:  # Visible is minimum requirement
+                    # Give base score if clickable or has button/link role
+                    if is_clickable or role_id in (1, 2, 3):
+                        similarity += 0.3  # Base score
                     
-                    # Check position proximity
+                    # Bonus for button/link/submit role
+                    if role_id in (1, 2, 3):  # button, link, or submit
+                        similarity += 0.2
+                    
+                    # Check position proximity if coordinates available
                     if hasattr(action, "x") and hasattr(action, "y"):
                         if action.x is not None and action.y is not None:
                             # Euclidean distance
@@ -361,32 +382,44 @@ class DatasetTrajectoryProvider(TrajectoryProvider):
                             # Very close (within 20 pixels): +0.5
                             if distance < 20:
                                 similarity += 0.5
-                            # Close (within 50 pixels): +0.3
+                            # Close (within 50 pixels): +0.4
                             elif distance < 50:
-                                similarity += 0.3
-                            # Moderately close (within 100 pixels): +0.1
+                                similarity += 0.4
+                            # Moderately close (within 100 pixels): +0.2
                             elif distance < 100:
+                                similarity += 0.2
+                            # Far but visible (within 200 pixels): +0.1
+                            elif distance < 200:
                                 similarity += 0.1
-                    
-                    # Bonus for button/link role
-                    if role_id in (1, 2):  # button or link
-                        similarity += 0.1
+                    else:
+                        # No coordinates - just match by role
+                        if role_id in (1, 2, 3) and is_clickable:
+                            similarity += 0.2  # Decent match without position
                     
             # TYPE/INPUT ACTIONS: Match editable + focusable elements
             elif action_type == "TypeAction":
-                if is_editable and is_focusable and is_visible:
-                    similarity += 0.6  # Base score for textbox
-                    
-                    # Bonus for textbox role
-                    if role_id == 4:  # textbox
-                        similarity += 0.3
-                    
-                    # If expert action has coordinates, check position too
-                    if hasattr(action, "x") and hasattr(action, "y"):
-                        if action.x is not None and action.y is not None:
-                            distance = ((action.x - center_x_px) ** 2 + (action.y - center_y_px) ** 2) ** 0.5
-                            if distance < 50:
-                                similarity += 0.1
+                # Must be visible
+                if is_visible:
+                    # Editable or focusable is good
+                    if is_editable or is_focusable:
+                        similarity += 0.4  # Base score
+                        
+                        # Bonus for textbox role
+                        if role_id == 4:  # textbox
+                            similarity += 0.3
+                        
+                        # Both editable AND focusable is even better
+                        if is_editable and is_focusable:
+                            similarity += 0.2
+                        
+                        # If expert action has coordinates, check position too
+                        if hasattr(action, "x") and hasattr(action, "y"):
+                            if action.x is not None and action.y is not None:
+                                distance = ((action.x - center_x_px) ** 2 + (action.y - center_y_px) ** 2) ** 0.5
+                                if distance < 50:
+                                    similarity += 0.2
+                                elif distance < 100:
+                                    similarity += 0.1
                                 
             # SELECT ACTIONS: Match editable elements (dropdowns)
             elif action_type == "SelectAction":
@@ -404,13 +437,10 @@ class DatasetTrajectoryProvider(TrajectoryProvider):
             # Just give a small base score for visible elements
             elif action_type == "ScrollAction":
                 if is_visible:
-                    similarity += 0.3
-            
-            # NAVIGATE/WAIT ACTIONS: Cannot match from element metadata
-            # These don't correspond to DOM elements
-            elif action_type in ("NavigateAction", "WaitAction"):
-                # These actions don't have corresponding topk candidates
-                similarity = 0.0
+                    similarity += 0.4
+                # Scroll can match any visible, clickable element
+                if is_clickable:
+                    similarity += 0.2
             
             return min(similarity, 1.0)  # Cap at 1.0
             

@@ -10,9 +10,13 @@ Para simplicidad y velocidad inicial:
 """
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
+from loguru import logger
+
+from ..utils.dom_cleaner import get_dom_cleaner
+from ..utils.reranker import get_reranker
 
 
 @dataclass
@@ -46,12 +50,27 @@ def _tokenize(s: str) -> list[str]:
 
 
 class BrowserManager:
-    def __init__(self, page):
+    def __init__(self, page, use_reranker: bool = True, reranker_model_path: Optional[str] = None):
         self.page = page
+        self.use_reranker = use_reranker
+        self.reranker = get_reranker(model_path=reranker_model_path) if use_reranker else None
+        self.dom_cleaner = get_dom_cleaner()
 
-    async def snapshot_text(self) -> Tuple[str, str]:
+    async def snapshot_text(self, clean_dom: bool = True) -> Tuple[str, str]:
+        """Get page snapshot with optional DOM cleaning.
+        
+        Args:
+            clean_dom: Whether to clean DOM using BetterSoup
+            
+        Returns:
+            Tuple of (html, url)
+        """
         html = await self.page.content()
         url = self.page.url
+        
+        if clean_dom:
+            html = self.dom_cleaner.clean(html)
+        
         return html, url
 
     async def candidates(self) -> List[Candidate]:
@@ -100,8 +119,68 @@ class BrowserManager:
             )
         return out
 
-    async def topk(self, task_prompt: str, K: int) -> Tuple[List[Candidate], np.ndarray, dict]:
+    async def topk(self, task_prompt: str, K: int, use_llm: bool = False) -> Tuple[List[Candidate], np.ndarray, dict]:
+        """Get top K candidates using reranker or fallback to hardcoded method.
+        
+        Args:
+            task_prompt: Task description
+            K: Number of top candidates to return
+            use_llm: Whether to use LLM for reranking (if reranker available)
+            
+        Returns:
+            Tuple of (top_candidates, click_mask, macros)
+        """
         cands = await self.candidates()
+        
+        # Use reranker if available and enabled
+        if self.use_reranker and self.reranker:
+            try:
+                top, click_mask = self.reranker.rerank(task_prompt, cands, K, use_llm=use_llm)
+                logger.debug(f"Reranker selected {len(top)} candidates")
+            except Exception as e:
+                logger.warning(f"Reranker failed: {e}. Falling back to hardcoded method.")
+                top, click_mask = self._hardcoded_topk(task_prompt, cands, K)
+        else:
+            # Fallback to hardcoded method
+            top, click_mask = self._hardcoded_topk(task_prompt, cands, K)
+        
+        # Ensure we have exactly K candidates
+        while len(top) < K:
+            top.append(Candidate(
+                idx=len(top),
+                tag="",
+                role=None,
+                text="",
+                clickable=False,
+                focusable=False,
+                editable=False,
+                visible=False,
+                enabled=False,
+                bbox=None,
+            ))
+        top = top[:K]
+        
+        # Update click mask to match K
+        if len(click_mask) < K:
+            click_mask = np.pad(click_mask, (0, K - len(click_mask)), constant_values=False)
+        click_mask = click_mask[:K]
+        
+        # macros (unchanged)
+        macros = {
+            "type_confirm": any(c.focusable and c.visible and c.enabled for c in cands),
+            "submit": any(
+                (c.clickable and c.visible and c.enabled and ((c.role or "").lower() in {"button", "submit"} or any(k in (c.text or "").lower() for k in ("submit", "search", "go"))))
+                for c in cands
+            ),
+            "scroll_down": True,
+            "scroll_up": True,
+            "back": True,
+        }
+        
+        return top, click_mask, macros
+    
+    def _hardcoded_topk(self, task_prompt: str, cands: List[Candidate], K: int) -> Tuple[List[Candidate], np.ndarray]:
+        """Fallback hardcoded topK selection (original method)."""
         toks_goal = set(_tokenize(task_prompt))
 
         def score(c: Candidate) -> float:
@@ -137,19 +216,8 @@ class BrowserManager:
         # máscara CLICK_K
         click_mask = np.zeros((K,), dtype=np.bool_)
         for i, c in enumerate(top):
-            click_mask[i] = bool(c.clickable and c.visible and c.enabled)
+            if i < K:
+                click_mask[i] = bool(c.clickable and c.visible and c.enabled)
 
-        # macros
-        macros = {
-            "type_confirm": any(c.focusable and c.visible and c.enabled for c in cands),
-            "submit": any(
-                (c.clickable and c.visible and c.enabled and ((c.role or "").lower() in {"button", "submit"} or any(k in (c.text or "").lower() for k in ("submit", "search", "go"))))
-                for c in cands
-            ),
-            "scroll_down": True,
-            "scroll_up": True,
-            "back": True,
-        }
-
-        return top, click_mask, macros
+        return top, click_mask
 
